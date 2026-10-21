@@ -20,6 +20,9 @@ RUN pip install --no-cache-dir \
 
 WORKDIR /app
 COPY server.py /app/server.py
+# 预热素材：一段真实语音（本项目 TTS 合成）。server.py 的 _warmup() 会在 uvicorn
+# 开始监听之前用它跑一次完整推理，把 13 秒的冷启动开销从「用户第一句话」挪到启动期。
+COPY warmup.ogg /app/warmup.ogg
 
 EXPOSE 8082
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8082"]

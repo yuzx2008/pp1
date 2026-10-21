@@ -52,6 +52,7 @@ asr_model = Qwen3ASRModel.from_pretrained(
     device_map="auto",
 )
 print("Ready.", flush=True)
+# 权重加载完还不算真的就绪：第一次 transcribe 还有一笔一次性开销（见文件末尾的 _warmup）。
 
 app = FastAPI()
 
@@ -82,6 +83,38 @@ def _transcribe_file(filepath: str, language: str | None = None, context: str = 
         language=language or None,
     )
     return results[0].text
+
+
+# 预热输入：随镜像分发的真实语音片段（Ogg Opus，约 5 秒，用本项目自己的 TTS 合成，
+# 内容无所谓）。必须用语音而不是现场造的噪声——实测噪声预热只吃掉 13 秒里的 4 秒，
+# 剩下 9 秒要等第一次真正跑起解码循环、碰到长输入时才付出，那样它还是会落到用户的
+# 第一句话上。
+WARMUP_AUDIO = "/app/warmup.ogg"
+
+
+def _warmup() -> None:
+    """在 uvicorn 开始监听之前先跑一次完整推理，把冷启动开销提前付掉。
+
+    实测：权重是在 import 期加载的（上面的 from_pretrained），但**第一次**
+    transcribe 还有一整批一次性初始化——transformers 首次 generate、CUDA kernel /
+    cuDNN 选择、冷容器里的驱动与页缓存加载，以及第一次真正跑解码循环要占的显存和算子。
+    整笔实测 13.3 秒，而 brain 侧的 STT 超时是写死的 13 秒（pp-brain-server
+    `apps/brains/src/brain-center.ts`：`AbortSignal.timeout(13000)`），于是 asr 每次
+    重启后用户说的第一句话必然被判超时（客户端看到 502），重说一遍才好。
+
+    这里把它挪进启动流程：uvicorn 要等本模块 import 完才开始监听，k8s 又只在
+    `/health` 通得过之后才把 pod 置为 Ready，所以预热跑完之前 Service 一直没有
+    endpoint——brain 永远打不到冷的 asr。
+    """
+    if not os.path.exists(WARMUP_AUDIO):
+        print(f"Warmup skipped: {WARMUP_AUDIO} 不存在，冷启动后的第一次转写会变慢", flush=True)
+        return
+    started = time.time()
+    try:
+        text = _transcribe_file(WARMUP_AUDIO)
+        print(f"Warmup done in {time.time() - started:.2f}s (text={text!r})", flush=True)
+    except Exception as e:  # 预热失败不值得拦住整个服务，退回未预热的老行为并留下痕迹
+        print(f"Warmup FAILED ({type(e).__name__}: {e}); 冷启动后的第一次转写可能再次超时", flush=True)
 
 
 async def _handle_transcription(
@@ -145,3 +178,8 @@ async def audio_transcriptions(req: TranscriptionRequest):
 @app.get("/health")
 async def health():
     return {"status": "ok", "model": MODEL}
+
+
+# 必须放在文件末尾：预热要调用上面定义的 _transcribe_file。模块 import 完之前
+# uvicorn 不会开始监听，所以这行就是「开始对外服务」之前最后一道动作。
+_warmup()
