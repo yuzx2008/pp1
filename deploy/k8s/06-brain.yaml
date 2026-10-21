@@ -1,0 +1,58 @@
+# compose 的 brains 服务：pp-brain-server（Node 24 直接跑 .ts），不占 GPU。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: brain
+  namespace: pp1
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: brain}
+  template:
+    metadata:
+      labels: {app: brain}
+    spec:
+      tolerations:
+        - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      containers:
+        - name: brain
+          # 必须带 registry 前缀（原因同 04-asr.yaml）
+          image: @@IMAGE_REGISTRY@@/pp1/brain:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8787}
+          envFrom:
+            - configMapRef: {name: pp1-env}
+            # token 只在 Secret 里（MIGHT_BRAINS_TOKEN）；envFrom 多条时后者覆盖前者，
+            # 这里排在 ConfigMap 之后，即使有人在 ConfigMap 里写了同名键也以 Secret 为准。
+            - secretRef: {name: pp1-brain-token}
+          volumeMounts:
+            - {name: logs, mountPath: /app/logs}
+          resources:
+            requests: {cpu: 200m, memory: 256Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          # brain 没有 `/` 路由（四个端点之外都是 404），所以探针用 TCP 连通性
+          readinessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+      volumes:
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: brain
+  namespace: pp1
+spec:
+  type: ClusterIP
+  selector: {app: brain}
+  ports:
+    - {name: http, port: 8787, targetPort: http}

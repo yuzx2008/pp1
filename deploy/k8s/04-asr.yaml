@@ -1,0 +1,71 @@
+# compose 的 asr 服务：Qwen3-ASR-1.7B，OpenAI 兼容转写接口，无状态 HTTP，1 张 GPU 单元/副本。
+#
+# 为什么要 2 个副本：单副本 + Recreate 时，重启/升级期间 Service 一个可用端点都没有，
+# brain 的转写请求直接失败。2 副本配 `maxSurge: 0 / maxUnavailable: 1`，滚动过程中
+# 始终有 1 个 Ready 副本在服务（先删一个、再起一个，起新的那段时间由旧的那个扛）。
+#
+# 为什么不是 `maxSurge: 1 / maxUnavailable: 0`：节点上可分配的 GPU 单元数是有限的
+# （物理卡数 × time-slicing 份数），asr 2 + tts 1 + chat 1 就直接吃掉 4 个，surge 出来的
+# 第 3 个 asr 副本很可能没有单元可拿，会一直 Pending，rollout 卡死。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: asr
+  namespace: pp1
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+  selector:
+    matchLabels: {app: asr}
+  template:
+    metadata:
+      labels: {app: asr}
+    spec:
+      tolerations:
+        - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      containers:
+        - name: asr
+          # 必须写完整地址（@@IMAGE_REGISTRY@@ 来自 local.env）：`pp1/asr` 这种短名在
+          # kubelet 里等价于 docker.io/pp1/asr，换台节点就直接拉不到
+          # （本机 containerd 里 load 过才显得能用）。
+          image: @@IMAGE_REGISTRY@@/pp1/asr:0.1.2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8082}
+          envFrom:
+            - configMapRef: {name: pp1-env}
+          volumeMounts:
+            - {name: models, mountPath: /models, subPath: asr, readOnly: true}
+          resources:
+            requests: {cpu: "2", memory: 8Gi}
+            limits: {cpu: "8", memory: 24Gi, nvidia.com/gpu: 1}
+          # 模型加载 + 预热都跑完才起 uvicorn（0.1.2 起），给 10 分钟启动窗口
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 15
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: pp1-models}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: asr
+  namespace: pp1
+spec:
+  type: ClusterIP
+  selector: {app: asr}
+  ports:
+    - {name: http, port: 8082, targetPort: http}

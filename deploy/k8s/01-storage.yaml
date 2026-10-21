@@ -1,0 +1,28 @@
+# 权重与音色都放共享文件系统（RWX，storageClassName 来自 local.env 的 STORAGE_CLASS），
+# asr / tts / chat 共用一个 PVC。
+#   pp1-models/asr/Qwen3-ASR-1.7B/**   → asr 容器 /models（subPath asr，只读）
+#   pp1-models/tts/*.gguf              → tts 容器 /models（subPath tts，只读）
+#   pp1-voices/male-fun.wav            → tts 容器 /voices（读写，要写 .codes.bin）
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pp1-models
+  namespace: pp1
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: @@STORAGE_CLASS@@
+  resources:
+    requests:
+      storage: 30Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pp1-voices
+  namespace: pp1
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: @@STORAGE_CLASS@@
+  resources:
+    requests:
+      storage: 1Gi

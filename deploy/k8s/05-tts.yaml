@@ -1,0 +1,74 @@
+# compose 的 tts 服务：moss-tts-windowed（常驻 daemon + FastAPI 前端），容器内 8080，1 张 GPU。
+# compose 的 init: true（收尸进程）在 k8s 里没有对应物：entrypoint 最后 exec 了 uvicorn，
+# daemon 守护循环是它的子进程，各自回收自己的子进程，实际影响可忽略。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tts
+  namespace: pp1
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: tts}
+  template:
+    metadata:
+      labels: {app: tts}
+    spec:
+      tolerations:
+        - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      securityContext:
+        runAsUser: 1000     # 对应 compose 的 MOSS_UID / MOSS_GID
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: tts
+          # 必须带 registry 前缀（原因同 04-asr.yaml）
+          image: @@IMAGE_REGISTRY@@/pp1/tts:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8080}
+          envFrom:
+            - configMapRef: {name: pp1-env}
+          volumeMounts:
+            - {name: models, mountPath: /models, subPath: tts, readOnly: true}
+            - {name: voices, mountPath: /voices}
+            - {name: run, mountPath: /run/moss}
+            - {name: logs, mountPath: /var/log/moss}
+          resources:
+            requests: {cpu: "2", memory: 8Gi}
+            limits: {cpu: "8", memory: 32Gi, nvidia.com/gpu: 1}
+          # 常驻模型加载 + 注册音色 codes 都要时间（compose start_period 90s，这里给 15 分钟）
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 15
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: pp1-models}
+        - name: voices
+          persistentVolumeClaim: {claimName: pp1-voices}
+        - name: run
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tts
+  namespace: pp1
+spec:
+  type: ClusterIP
+  selector: {app: tts}
+  ports:
+    - {name: http, port: 8080, targetPort: http}

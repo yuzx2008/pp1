@@ -1,0 +1,501 @@
+# brain 后台 ASR 修订旁路用的 chat 端点：OpenAI 兼容、**原生吃音频**（input_audio + base64 Ogg/Opus）、
+# 支持 tool calling（模型调用 notify(warning) 工具）。
+#
+# 选型：vLLM 0.32.0 官方镜像 + Qwen2.5-Omni-7B 的 thinker（vLLM 的 Qwen2_5OmniThinkerForConditionalGeneration）。
+# 为什么是它：
+#   - 官方镜像自带 torchcodec 0.17 + 系统 ffmpeg，直接能解 Ogg/Opus（实测），不用自建镜像；
+#   - 7B 权重 22.4 GB、显存约 20 GB，一张 4090（各剩约 40 GB）放得下；
+#   - Qwen2.5-Omni 的 LLM 主干来自 Qwen2.5，Hermes 风格 function calling 是它训练过的格式。
+# 唯一的坑：模型自带的 chat template **没有 tools 分支**，所以这里用 ConfigMap 塞一份
+# 「Qwen2.5 官方 tools 模板 + Omni 多模态分支」合成模板；工具调用另配自定义解析器
+# （模型不吐 <tool_call> 标签，内置解析器认不出裸 JSON）。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pp1-chat-models
+  namespace: pp1
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: @@STORAGE_CLASS@@
+  resources:
+    requests:
+      # 单建一个 PVC 而不是塞进 pp1-models：那个 30Gi 里已有 asr 4.7G + tts 8.9G，
+      # 再放 22.4G 会顶到上限；之后单独扩容或删掉也互不影响。
+      storage: 40Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pp1-chat-template
+  namespace: pp1
+data:
+  qwen-omni-tools.jinja: |
+    {%- if tools %}
+        {{- '<|im_start|>system\n' }}
+        {%- if messages[0]['role'] == 'system' %}
+            {{- messages[0]['content'] }}
+        {%- else %}
+            {{- 'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' }}
+        {%- endif %}
+        {{- "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+        {%- for tool in tools %}
+            {{- "\n" }}
+            {{- tool | tojson }}
+        {%- endfor %}
+        {{- "\n</tools>\n\nWhen you call a function, reply with the json object only — no prose, no extra tags:\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n\nIMPORTANT: only when the transcript is unfaithful to the audio or could mislead the agent, you MUST call the matching function instead of explaining it in words. Otherwise call no function and answer the user's request in text as usual.<|im_end|>\n" }}
+    {%- else %}
+        {%- if messages[0]['role'] == 'system' %}
+            {{- '<|im_start|>system\n' + messages[0]['content'] + '<|im_end|>\n' }}
+        {%- else %}
+            {{- '<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+    {%- set audio_count = namespace(value=0) %}
+    {%- set image_count = namespace(value=0) %}
+    {%- set video_count = namespace(value=0) %}
+    {%- for message in messages %}
+        {%- if (message.role == "user") or (message.role == "system" and not loop.first) or (message.role == "assistant" and not message.tool_calls) %}
+            {%- if message.content is string %}
+                {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>' + '\n' }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\n' }}
+                {%- for content in message.content %}
+                    {%- if content['type'] == 'image' or 'image' in content or 'image_url' in content %}
+                        {%- set image_count.value = image_count.value + 1 %}
+                        {{- '<|vision_bos|><|IMAGE|><|vision_eos|>' }}
+                    {%- elif content['type'] == 'audio' or 'audio' in content or 'audio_url' in content or 'input_audio' in content %}
+                        {%- set audio_count.value = audio_count.value + 1 %}
+                        {{- '<|audio_bos|><|AUDIO|><|audio_eos|>' }}
+                    {%- elif content['type'] == 'video' or 'video' in content %}
+                        {%- set video_count.value = video_count.value + 1 %}
+                        {{- '<|vision_bos|><|VIDEO|><|vision_eos|>' }}
+                    {%- elif 'text' in content %}
+                        {{- content['text'] }}
+                    {%- endif %}
+                {%- endfor %}
+                {{- '<|im_end|>' + '\n' }}
+            {%- endif %}
+        {%- elif message.role == "assistant" %}
+            {{- '<|im_start|>' + message.role }}
+            {%- if message.content is string and message.content %}
+                {{- '\n' + message.content }}
+            {%- endif %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if tool_call.function is defined %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '\n<tool_call>\n{"name": "' }}
+                {{- tool_call.name }}
+                {{- '", "arguments": ' }}
+                {%- if tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
+                {%- else %}
+                    {{- tool_call.arguments | tojson }}
+                {%- endif %}
+                {{- '}\n</tool_call>' }}
+            {%- endfor %}
+            {{- '<|im_end|>\n' }}
+        {%- elif message.role == "tool" %}
+            {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != "tool") %}
+                {{- '<|im_start|>user' }}
+            {%- endif %}
+            {{- '\n<tool_response>\n' }}
+            {{- message.content }}
+            {{- '\n</tool_response>' }}
+            {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+                {{- '<|im_end|>\n' }}
+            {%- endif %}
+        {%- endif %}
+    {%- endfor %}
+    {%- if add_generation_prompt %}
+        {{- '<|im_start|>assistant\n' }}
+    {%- endif %}
+  omni_bare_json_tool_parser.py: |
+    """Qwen2.5-Omni（vLLM 0.32）用的工具调用解析器插件。
+
+    为什么要自己写：实测这个模型在套上 Qwen2.5 官方 tools 模板后，**能正确产出工具调用，
+    但不带 `<tool_call>` 标签**，直接吐裸 JSON：
+
+        {"name": "notify", "arguments": {"warning": "..."}}
+
+    内置的 `hermes` 解析器要求标签，于是工具调用会被当成普通文本返回（brain 就收不到
+    `notify` 了）。这个插件两种形态都认：有标签按标签切，没有就扫描括号平衡的 JSON 片段。
+
+    用法（见 deploy/k8s/08-chat.yaml）：
+        --tool-parser-plugin /templates/omni_bare_json_tool_parser.py
+        --tool-call-parser omni_bare_json
+    """
+    import json
+    from collections.abc import Sequence
+
+    from vllm.entrypoints.generate.base.protocol import (
+        DeltaFunctionCall,
+        DeltaMessage,
+        DeltaToolCall,
+        ExtractedToolCallInformation,
+        FunctionCall,
+        ToolCall,
+    )
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from vllm.renderers.chat_utils import make_tool_call_id
+    from vllm.tool_parsers.abstract_tool_parser import ToolParser, ToolParserManager
+    from vllm.tool_parsers.utils import partial_tag_overlap
+
+    START = "<tool_call>"
+    END = "</tool_call>"
+
+
+    def _balanced_json_spans(text: str) -> list[tuple[int, int]]:
+        """扫描所有括号平衡的 JSON 片段，返回 [(start, end)]。忽略字符串里的括号。"""
+        spans: list[tuple[int, int]] = []
+        stack: list[str] = []
+        start = -1
+        in_str = False
+        esc = False
+        for i, ch in enumerate(text):
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch in "{[":
+                if not stack:
+                    start = i
+                stack.append(ch)
+            elif ch in "}]":
+                if not stack:
+                    continue
+                opened = stack.pop()
+                if (opened, ch) not in (("{", "}"), ("[", "]")):
+                    stack.clear()
+                    start = -1
+                    continue
+                if not stack:
+                    spans.append((start, i + 1))
+                    start = -1
+        return spans
+
+
+    def _load_calls(text: str) -> list[dict]:
+        """从一段文本里抽出工具调用 {"name":..., "arguments":...}。"""
+        calls: list[dict] = []
+        for begin, end in _balanced_json_spans(text):
+            try:
+                obj = json.loads(text[begin:end])
+            except Exception:
+                continue
+            for item in obj if isinstance(obj, list) else [obj]:
+                if isinstance(item, dict) and isinstance(item.get("name"), str):
+                    args = item.get("arguments", item.get("parameters", {}))
+                    calls.append({"name": item["name"], "arguments": args})
+        return calls
+
+
+    def _extract(text: str) -> list[dict]:
+        """先按 <tool_call> 标签切；没有标签就把整段当候选。"""
+        segments: list[str] = []
+        pos = 0
+        while True:
+            begin = text.find(START, pos)
+            if begin == -1:
+                break
+            body_start = begin + len(START)
+            body_end = text.find(END, body_start)
+            segments.append(text[body_start : body_end if body_end != -1 else len(text)])
+            pos = body_end + len(END) if body_end != -1 else len(text)
+        if segments:
+            calls: list[dict] = []
+            for seg in segments:
+                calls.extend(_load_calls(seg))
+            return calls
+        return _load_calls(text)
+
+
+    @ToolParserManager.register_module("omni_bare_json")
+    class OmniBareJsonToolParser(ToolParser):
+        def __init__(self, tokenizer, tools=None):
+            super().__init__(tokenizer, tools)
+            self._tool_mode = False
+            self._tool_sent = False
+            self._sent_content = 0
+
+        def extract_tool_calls(
+            self, model_output: str, request: ChatCompletionRequest
+        ) -> ExtractedToolCallInformation:
+            calls = _extract(model_output)
+            if not calls:
+                return ExtractedToolCallInformation(
+                    tools_called=False, tool_calls=[], content=model_output
+                )
+            cut = model_output.find(START)
+            if cut == -1:
+                spans = _balanced_json_spans(model_output)
+                cut = spans[0][0] if spans else len(model_output)
+            content = model_output[:cut].strip()
+            return ExtractedToolCallInformation(
+                tools_called=True,
+                tool_calls=[
+                    ToolCall(
+                        type="function",
+                        function=FunctionCall(
+                            name=call["name"],
+                            arguments=json.dumps(call["arguments"], ensure_ascii=False),
+                        ),
+                    )
+                    for call in calls
+                ],
+                content=content or None,
+            )
+
+        def extract_tool_calls_streaming(
+            self,
+            previous_text: str,
+            current_text: str,
+            delta_text: str,
+            previous_token_ids: Sequence[int],
+            current_token_ids: Sequence[int],
+            delta_token_ids: Sequence[int],
+            request: ChatCompletionRequest,
+        ) -> DeltaMessage | None:
+            if self._tool_sent:
+                return None
+
+            stripped = current_text.lstrip()
+            looks_like_call = (
+                self._tool_mode
+                or START in current_text
+                or stripped.startswith("{")
+                or stripped.startswith("[")
+            )
+
+            if looks_like_call:
+                self._tool_mode = True
+                # 参数是短 JSON，等它整体成形再一次性发出，不做逐字增量。
+                # `_extract` 只认括号平衡且能 json.loads 的片段，所以拿到 calls 就意味着已经完整。
+                calls = _extract(current_text)
+                if not calls:
+                    return None
+                call = calls[0]
+                args = json.dumps(call["arguments"], ensure_ascii=False)
+                self._tool_sent = True
+                self.current_tool_id = 0
+                self.prev_tool_call_arr = [{"name": call["name"], "arguments": args}]
+                self.streamed_args_for_tool = [args]
+                return DeltaMessage(
+                    tool_calls=[
+                        DeltaToolCall(
+                            index=0,
+                            id=make_tool_call_id(),
+                            type="function",
+                            function=DeltaFunctionCall(
+                                name=call["name"], arguments=args
+                            ),
+                        )
+                    ]
+                )
+
+            # 普通文本：透传，但要扣住可能是 "<tool_call>" 或 "{" 开头的尾巴
+            overlap = partial_tag_overlap(current_text, START)
+            sendable = len(current_text) - overlap
+            while sendable > self._sent_content and current_text[sendable - 1] == "{":
+                sendable -= 1
+            if sendable > self._sent_content:
+                chunk = current_text[self._sent_content : sendable]
+                self._sent_content = sendable
+                return DeltaMessage(content=chunk)
+            return None
+---
+# 权重下载：Qwen2.5-Omni-7B 全量 22.4 GB（thinker 与 talker 在同一批分片里，vLLM 只载 thinker）。
+# sha256 取自 HuggingFace 的 LFS oid；hf-mirror 优先。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pp1-chat-fetch-script
+  namespace: pp1
+data:
+  fetch.sh: |
+    #!/bin/sh
+    set -eu
+    DEST="${DEST:-@@WEIGHTS_DIR@@/Qwen2.5-Omni-7B}"
+    HF="https://hf-mirror.com/Qwen/Qwen2.5-Omni-7B/resolve/main"
+    mkdir -p "$DEST"
+    cd "$DEST"
+    failed=0
+
+    get() { # get <文件> <期望sha256|-> 
+      out="$1"; sha="$2"
+      if [ -s "$out" ]; then
+        if [ "$sha" = "-" ] || [ "$(sha256sum "$out" | cut -d' ' -f1)" = "$sha" ]; then
+          echo "SKIP $out ($(wc -c <"$out") bytes)"
+          return 0
+        fi
+      fi
+      echo "GET  $HF/$out"
+      rm -f "$out.part.$$"
+      if curl -fL --retry 4 --retry-delay 3 --connect-timeout 20 --max-time 7200 \
+           -o "$out.part.$$" "$HF/$out" && [ -s "$out.part.$$" ]; then
+        mv "$out.part.$$" "$out"
+      else
+        echo "!! 下载失败 $out"; rm -f "$out.part.$$"; failed=1; return 1
+      fi
+      if [ "$sha" != "-" ]; then
+        got="$(sha256sum "$out" | cut -d' ' -f1)"
+        if [ "$got" != "$sha" ]; then
+          echo "!! SHA 不匹配 $out: $got != $sha"; rm -f "$out"; failed=1; return 1
+        fi
+      fi
+      echo "OK   $out ($(wc -c <"$out") bytes)"
+    }
+
+    get model-00001-of-00005.safetensors 5edb02fd7c98803239468375cc9dc1bff492865c2aa086b78f348597021d6cbc || true
+    get model-00002-of-00005.safetensors 7c99b55c6e5bc63fd4b19d4dc23cdc3ddac4b0101bb3c0958cc2b5d05c2bbafe || true
+    get model-00003-of-00005.safetensors ad00c3ac296300db905934ed213c4077ff49b85d30c0099270c814e2c77ec812 || true
+    get model-00004-of-00005.safetensors 152bc7d81441eaba22547d8d96c03d32dd592ce0e0e1d0e449347a4b23a532d3 || true
+    get model-00005-of-00005.safetensors b8b18276481ba8cdf4fe2c98ac4c7a2da6e0d1c8a51850d162a391760cb2b81e || true
+    get tokenizer.json 8441917e39ae0244e06d704b95b3124795cec478e297f9afac39ba670d7e9d99 || true
+    get spk_dict.pt 6a05609b28f5d42b7b748f0f07592545c8f1f6885b9ae8fff64baf56e86b2a18 || true
+    for f in config.json generation_config.json model.safetensors.index.json preprocessor_config.json \
+             tokenizer_config.json chat_template.json special_tokens_map.json added_tokens.json \
+             vocab.json merges.txt README.md .gitattributes; do
+      get "$f" - || true
+    done
+
+    echo "--- 结果 ---"
+    du -sh "$DEST"
+    if [ "$failed" = 0 ]; then
+      date -u +%Y-%m-%dT%H:%M:%SZ > "$DEST/.fetch-ok"
+      echo "全部下载完成"
+    else
+      echo "有文件失败，退出码 1"; exit 1
+    fi
+# 权重下载是**一次性动作**，权重已经在 PVC pp1-chat-models 里了。
+# 下面这段 Job 故意注释掉：留着的话谁整份 `kubectl apply -f 08-chat.yaml` 都会再下一遍 20.8 GB。
+# 要重下（换模型版本 / PVC 被清）时：把下面 33 行的行首 `# ` 去掉，apply 之后再注释回来。
+# ---
+# apiVersion: batch/v1
+# kind: Job
+# metadata:
+#   name: pp1-fetch-chat-weights
+#   namespace: pp1
+# spec:
+#   backoffLimit: 0
+#   template:
+#     metadata:
+#       labels: {app: pp1-fetch-chat-weights}
+#     spec:
+#       restartPolicy: Never
+#       tolerations:
+#         - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+#       containers:
+#         - name: fetch
+#           image: alpine:3.21
+#           imagePullPolicy: IfNotPresent
+#           command: ["/bin/sh", "-c", "command -v curl >/dev/null || apk add --no-cache curl; exec /bin/sh /scripts/fetch.sh"]
+#           env:
+#             - name: DEST
+#               value: @@WEIGHTS_DIR@@/Qwen2.5-Omni-7B
+#           volumeMounts:
+#             - {name: models, mountPath: /data}
+#             - {name: script, mountPath: /scripts}
+#           resources:
+#             requests: {cpu: 100m, memory: 128Mi}
+#             limits: {cpu: "2", memory: 1Gi}
+#       volumes:
+#         - name: models
+#           persistentVolumeClaim: {claimName: pp1-chat-models}
+#         - name: script
+#           configMap: {name: pp1-chat-fetch-script}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat
+  namespace: pp1
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: chat}
+  template:
+    metadata:
+      labels: {app: chat}
+    spec:
+      tolerations:
+        - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      containers:
+        - name: chat
+          # 官方镜像 docker.io/vllm/vllm-openai:v0.32.0 的副本，推在 @@IMAGE_REGISTRY@@ 下，
+          # 节点重建或镜像被清理后还能拉回来。
+          image: @@IMAGE_REGISTRY@@/pp1/chat-vllm:v0.32.0
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            # 注意：PVC 里的路径是 chat/Qwen2.5-Omni-7B，而 subPath 已经把 chat/ 挂成了 /models
+            #（与 asr / tts 同一套约定），所以这里只有一层。
+            - /models/Qwen2.5-Omni-7B
+            - --served-model-name=qwen2.5-omni-7b
+            - --host=0.0.0.0
+            - --port=8000
+            # 模型自带模板没有 tools 分支，这里挂合成模板（见本文件顶部说明）
+            - --chat-template=/templates/qwen-omni-tools.jinja
+            # 允许请求里带 tools 而不用显式指定 tool_choice（brain 正是这么发的）
+            - --enable-auto-tool-choice
+            # 模型吐的是裸 JSON（无 <tool_call> 标签），内置解析器都不认，所以挂自定义插件
+            # （同一个 ConfigMap，见 pp1-chat-template 的 omni_bare_json_tool_parser.py）
+            - --tool-parser-plugin=/templates/omni_bare_json_tool_parser.py
+            - --tool-call-parser=omni_bare_json
+            # 卡上有邻居（asr 约 5 GB，或 tts 两个常驻 daemon 合计约 13.7 GB），按 48 GB 卡的
+            # 0.55 要 27 GB，最坏情况（和 tts 同卡）合计约 40.7 GB，仍在 48 GB 之内。
+            - --gpu-memory-utilization=0.55
+            - --max-model-len=32768
+            # 修订请求最多带 7 段音频（brain 的 MAX_REVISE_AUDIO）
+            - --limit-mm-per-prompt={"audio":8,"image":1,"video":1}
+          # 走 device plugin 正规申请。集群的 device plugin 已开 time-slicing
+          # （每张卡切若干份，node 上报的 nvidia.com/gpu 大于物理卡数），见 deploy/k8s/DEPLOY.md。
+          # 注意：time-slicing 不做显存隔离，也不保证落在哪张物理卡上，所以
+          # --gpu-memory-utilization 仍需按「和邻居同卡」的最坏情况取值。
+          # 这里**不要**再设 NVIDIA_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES：
+          # 插件会用 --pass-device-specs 按实际分配结果注入，手写会覆盖它。
+          ports:
+            - {name: http, containerPort: 8000}
+          volumeMounts:
+            - {name: models, mountPath: /models, subPath: chat, readOnly: true}
+            - {name: templates, mountPath: /templates, readOnly: true}
+          resources:
+            requests: {cpu: "2", memory: 16Gi, nvidia.com/gpu: 1}
+            limits: {cpu: "8", memory: 48Gi, nvidia.com/gpu: 1}
+          # 权重 22.4 GB + 引擎初始化，给 20 分钟启动窗口
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 120
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 15
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: pp1-chat-models}
+        - name: templates
+          configMap: {name: pp1-chat-template}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat
+  namespace: pp1
+spec:
+  type: ClusterIP
+  selector: {app: chat}
+  ports:
+    - {name: http, port: 8000, targetPort: http}

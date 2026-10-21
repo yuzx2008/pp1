@@ -1,0 +1,64 @@
+# 从 docker-compose.yml + .env.example + scripts/onboard.ts 逐项翻译过来的运行时配置。
+# 与 compose 的差异：服务名不变（asr / tts），所以 brain 的 STT/TTS 地址不用改。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pp1-env
+  namespace: pp1
+data:
+  # ── ASR（docker/asr/server.py：ASR_MODEL 指向模型目录）──
+  ASR_MODEL: /models/Qwen3-ASR-1.7B
+
+  # ── TTS（moss-tts-windowed entrypoint.sh 认这些名字）──
+  MOSS_MODELS_DIR: /models
+  MOSS_VOICES_DIR: /voices
+  MOSS_DAEMON_SOCK: /run/moss/serve.sock
+  MOSS_LOG_DIR: /var/log/moss
+  MOSS_LISTEN_PORT: "8080"
+  MOSS_NGL: "-1"
+  MOSS_MODEL_FILE: moss_tts_v15_firstclass_q4_k_m_aq8.gguf
+  MOSS_DECODER_FILE: moss_tts_audio_decoder_f16.gguf
+  # 每个常驻 daemon 约 6.8 GB 显存（一套模型全量常驻），都跑在同一张卡上（RTF≈0.2）。
+  # upstream 的 daemonsFor() 在 48 GB 卡上会算成 3，这里按需求固定 2（约 13.6 GB）。
+  MOSS_DAEMONS: "2"
+  MOSS_LANGUAGE: zh
+  MOSS_AUDIO_TEMPERATURE: "1.7"
+  MOSS_AUDIO_TOP_P: "0.8"
+  MOSS_AUDIO_TOP_K: "25"
+  MOSS_AUDIO_REPETITION_PENALTY: "1.0"
+  MOSS_STREAM_WINDOW: "32"
+  MOSS_STREAM_OVERLAP: "40"
+  MOSS_STREAM_LOOKAHEAD: "0"
+  MOSS_CTX_ROWS: "6000"
+  MOSS_CTX_KEEP: "2048"
+  MOSS_PREFILL_UBATCH: "384"
+  MOSS_PREFILL_BUDGET_MIB: "1000"
+  MOSS_MAX_INPUT_CHARS: "2048"
+  MOSS_QUEUE_MAX: "8"
+  MOSS_QUEUE_WAIT: "60"
+  MOSS_LOG_TEXT: "0"
+  MOSS_DISABLE_NONSTREAM: "1"
+
+  # ── brain 看到的 ASR / TTS：集群内 Service 名（等价 compose 里的 http://asr:8082/v1）──
+  STT_API_BASE_URL: http://asr:8082/v1
+  STT_API_KEY: ""
+  STT_MODEL: qwen-asr
+  TTS_API_BASE_URL: http://tts:8080/v1
+  TTS_API_KEY: ""
+  TTS_VOICE: male-fun
+
+  # ── brain 自身 ──
+  MIGHT_BRAINS_PORT: "8787"
+  # MIGHT_BRAINS_TOKEN 不在这里：它是密钥，放在 Secret pp1-brain-token（见 DEPLOY.md「brain 鉴权」）。
+  # 明文放 ConfigMap 等于把 token 写进 `kubectl get cm -o yaml` 和仓库。
+  MIGHT_BRAINS_POLL_TIMEOUT_MS: "25000"
+  # 1 = 把发往 chat 端点的原始请求/响应落到 /app/logs/revise/<日期>/<uuid>/（里面是完整对话内容，
+  # 排查时才临时开；`/app/logs` 是 emptyDir，pod 重建即丢）。
+  MIGHT_LOG_LLM: "0"
+
+  # ── chat 端点：集群内自建的 vLLM + Qwen2.5-Omni-7B（thinker），见 08-chat.yaml ──
+  # brain 后台每 3 次历史写入跑一轮 ASR 修订，把最近几条音频（base64 Ogg/Opus，OpenAI
+  # `input_audio` 格式）连同转写发给它；端点必须**原生吃音频**。主链路（听/说）不依赖它。
+  MIGHT_CHAT_API_BASE_URL: http://chat:8000/v1
+  MIGHT_CHAT_API_KEY: pp1-local   # 必须非空；本地 vLLM 不校验值
+  MIGHT_CHAT_MODEL: qwen2.5-omni-7b

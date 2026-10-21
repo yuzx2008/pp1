@@ -1,0 +1,125 @@
+# 权重下载：ASR ~4.7 GB + TTS ~8.9 GB ≈ 13.6 GB，落到 pp1-models PVC。
+# 来源与校验值对齐 scripts/onboard.ts（TTS 三个 gguf 的 sha256 就是 onboard 里 pin 的那三个；
+# ASR 两个 safetensors 的 sha256 取自 HuggingFace 的 LFS oid）。
+# hf-mirror 优先，失败回退 modelscope。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pp1-fetch-script
+  namespace: pp1
+data:
+  fetch.sh: |
+    #!/bin/sh
+    set -eu
+    DEST="${DEST:-/data}"
+    mkdir -p "$DEST/asr/Qwen3-ASR-1.7B" "$DEST/tts"
+
+    ASR_HF="https://hf-mirror.com/Qwen/Qwen3-ASR-1.7B/resolve/main"
+    ASR_MS="https://modelscope.cn/models/Qwen/Qwen3-ASR-1.7B/resolve/master"
+    TTS_HF="https://hf-mirror.com/thaut/moss-tts-windowed-gguf/resolve/main"
+
+    failed=0
+
+    get() { # get <目标文件> <期望sha256|-> <url 候选...>
+      out="$1"; sha="$2"; shift 2
+      if [ -s "$out" ]; then
+        if [ "$sha" = "-" ] || [ "$(sha256sum "$out" | cut -d' ' -f1)" = "$sha" ]; then
+          echo "SKIP $out ($(wc -c <"$out") bytes)"
+          return 0
+        fi
+      fi
+      for url in "$@"; do
+        echo "GET  $url"
+        rm -f "$out.part"
+        if curl -fL --retry 4 --retry-delay 3 --connect-timeout 20 --max-time 5400 \
+             -o "$out.part" "$url" && [ -s "$out.part" ]; then
+          mv "$out.part" "$out"
+          if [ "$sha" != "-" ]; then
+            got="$(sha256sum "$out" | cut -d' ' -f1)"
+            if [ "$got" != "$sha" ]; then
+              echo "SHA 不匹配 $out：$got != $sha"
+              rm -f "$out"
+              continue
+            fi
+          fi
+          echo "OK   $out ($(wc -c <"$out") bytes)"
+          return 0
+        fi
+        echo "下载失败：$url"
+      done
+      echo "!! $out 全部来源都失败"
+      failed=1
+      return 1
+    }
+
+    A="$DEST/asr/Qwen3-ASR-1.7B"
+    get "$A/model-00001-of-00002.safetensors" \
+        a4cd1f1a04d90b757dc7f7dd26254e69a013b19e80efe590a83c6a3bde8608d6 \
+        "$ASR_HF/model-00001-of-00002.safetensors" "$ASR_MS/model-00001-of-00002.safetensors" || true
+    get "$A/model-00002-of-00002.safetensors" \
+        6e0b9d9e09e2e0238e7ef3cc8a484ab387e91b90f1900bedf88bc92d7929ccfc \
+        "$ASR_HF/model-00002-of-00002.safetensors" "$ASR_MS/model-00002-of-00002.safetensors" || true
+    for f in model.safetensors.index.json config.json generation_config.json \
+             preprocessor_config.json tokenizer_config.json chat_template.json \
+             vocab.json merges.txt README.md .gitattributes; do
+      get "$A/$f" - "$ASR_HF/$f" "$ASR_MS/$f" || true
+    done
+
+    T="$DEST/tts"
+    get "$T/moss_tts_v15_firstclass_q4_k_m_aq8.gguf" \
+        2805b9889f63e2f8aa681361b2b1127b101d9c64610918b26fca488d44a0a2a6 \
+        "$TTS_HF/moss_tts_v15_firstclass_q4_k_m_aq8.gguf" || true
+    get "$T/moss_tts_audio_decoder_f16.gguf" \
+        84034fa745ee38bc0bacfde5904e19c2db3fb402e5fe079c655550b1f9b189c4 \
+        "$TTS_HF/moss_tts_audio_decoder_f16.gguf" || true
+    get "$T/moss_tts_audio_encoder_f16.gguf" \
+        8ca93e721ac95a56a64661b1fddfd990a8054abec58ac522a0103b8923902b46 \
+        "$TTS_HF/moss_tts_audio_encoder_f16.gguf" || true
+
+    echo "--- 结果 ---"
+    du -sh "$DEST/asr" "$DEST/tts"
+    if [ "$failed" = 0 ]; then
+      date -u +%Y-%m-%dT%H:%M:%SZ > "$DEST/.fetch-ok"
+      echo "全部下载完成"
+    else
+      echo "有文件失败，退出码 1"
+      exit 1
+    fi
+# 权重下载是**一次性动作**，权重已经在 PVC pp1-models 里了（asr/Qwen3-ASR-1.7B + tts/*.gguf）。
+# 下面这段 Job 故意注释掉：留着的话谁整份 `kubectl apply -f 03-fetch-weights.yaml` 都会再下一遍 12.7 GB。
+# 要重下（换模型版本 / PVC 被清）时：把下面 35 行的行首 `# ` 去掉，apply 之后再注释回来。
+# ---
+# apiVersion: batch/v1
+# kind: Job
+# metadata:
+#   name: pp1-fetch-weights
+#   namespace: pp1
+# spec:
+#   backoffLimit: 0
+#   template:
+#     metadata:
+#       labels: {app: pp1-fetch-weights}
+#     spec:
+#       restartPolicy: Never
+#       # 单节点 control-plane 集群的节点带 NoSchedule 污点（集群里现有负载同样都容忍它）
+#       tolerations:
+#         - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+#       containers:
+#         - name: fetch
+#           image: alpine:3.21
+#           imagePullPolicy: IfNotPresent
+#           command: ["/bin/sh", "-c", "command -v curl >/dev/null || apk add --no-cache curl; exec /bin/sh /scripts/fetch.sh"]
+#           env:
+#             - name: DEST
+#               value: /data
+#           volumeMounts:
+#             - {name: models, mountPath: /data}
+#             - {name: script, mountPath: /scripts}
+#           resources:
+#             requests: {cpu: 100m, memory: 128Mi}
+#             limits: {cpu: "2", memory: 1Gi}
+#       volumes:
+#         - name: models
+#           persistentVolumeClaim: {claimName: pp1-models}
+#         - name: script
+#           configMap: {name: pp1-fetch-script}

@@ -1,0 +1,89 @@
+# 三个 host 都解析到 ingress 所在节点的地址（用通配 DNS 指过去就不用逐个加记录），
+# 证书由 cert-manager 走 DNS-01 自动签发（issuer 名字来自 local.env 的 CLUSTER_ISSUER）。
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: pp1-tls
+  namespace: pp1
+spec:
+  secretName: pp1-tls
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: @@CLUSTER_ISSUER@@
+  dnsNames:
+    # 用通配符而不是三个名字：DNS-01 的 TXT 记录挂在基础域上，三个名字并发签发会
+    # 互相覆盖（实测只有第一个拿到 valid，另外两个一直 pending）。
+    # 通配符只有一个 dnsName，挑战落在 _acme-challenge.<域名>，一次就过。
+    # 证书按 SNI 提供，pp1 / pp1-asr / pp1-tts 三个 host 都能用。
+    - "*.@@INGRESS_DOMAIN@@"
+---
+# brain：手机/agent 连的就是这个。缓冲必须关掉，否则「前导 + 连续 Ogg 流」会被 nginx
+# 攒成一坨再吐，手机端要等整段合成完才出声。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: brain
+  namespace: pp1
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [pp1.@@INGRESS_DOMAIN@@]
+      secretName: pp1-tls
+  rules:
+    - host: pp1.@@INGRESS_DOMAIN@@
+      http:
+        paths:
+          - {path: /, pathType: Prefix, backend: {service: {name: brain, port: {name: http}}}}
+---
+# ASR：上行转写口径，验收用（也便于以后直接调 STT）。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: asr
+  namespace: pp1
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [pp1-asr.@@INGRESS_DOMAIN@@]
+      secretName: pp1-tls
+  rules:
+    - host: pp1-asr.@@INGRESS_DOMAIN@@
+      http:
+        paths:
+          - {path: /, pathType: Prefix, backend: {service: {name: asr, port: {name: http}}}}
+---
+# TTS：下行本身也是流式，缓冲同样关掉。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tts
+  namespace: pp1
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [pp1-tts.@@INGRESS_DOMAIN@@]
+      secretName: pp1-tls
+  rules:
+    - host: pp1-tts.@@INGRESS_DOMAIN@@
+      http:
+        paths:
+          - {path: /, pathType: Prefix, backend: {service: {name: tts, port: {name: http}}}}
