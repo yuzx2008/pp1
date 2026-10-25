@@ -40,10 +40,10 @@ data:
   MOSS_DISABLE_NONSTREAM: "1"
 
   # ── brain 看到的 ASR / TTS：集群内 Service 名（等价 compose 里的 http://asr:8082/v1）──
-  STT_API_BASE_URL: http://asr:8082/v1
+  STT_API_BASE_URL: http://devmachine-REPLACE-ME-MACHINE-ID.devmachine.svc.cluster.local:8082/v1
   STT_API_KEY: ""
   STT_MODEL: qwen-asr
-  TTS_API_BASE_URL: http://tts:8080/v1
+  TTS_API_BASE_URL: http://devmachine-REPLACE-ME-MACHINE-ID.devmachine.svc.cluster.local:8080/v1
   TTS_API_KEY: ""
   TTS_VOICE: male-fun
 
@@ -59,6 +59,6 @@ data:
   # ── chat 端点：集群内自建的 vLLM + Qwen2.5-Omni-7B（thinker），见 08-chat.yaml ──
   # brain 后台每 3 次历史写入跑一轮 ASR 修订，把最近几条音频（base64 Ogg/Opus，OpenAI
   # `input_audio` 格式）连同转写发给它；端点必须**原生吃音频**。主链路（听/说）不依赖它。
-  MIGHT_CHAT_API_BASE_URL: http://chat:8000/v1
-  MIGHT_CHAT_API_KEY: pp1-local   # 必须非空；本地 vLLM 不校验值
+  MIGHT_CHAT_API_BASE_URL: http://devmachine-REPLACE-ME-MACHINE-ID.devmachine.svc.cluster.local:8000/v1
+  MIGHT_CHAT_API_KEY: REPLACE-ME-LOCAL-KEY   # 必须非空；本地 vLLM 不校验值
   MIGHT_CHAT_MODEL: qwen2.5-omni-7b

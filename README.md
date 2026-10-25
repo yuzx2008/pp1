@@ -90,9 +90,13 @@ pp1-setup <command>          # or: deno run -A scripts/onboard.ts <command>
 
   all        doctor + fetch + env + build (default)
   doctor     docker / GPU / compute cap / disk checks
-  fetch      clone pinned components, download weights
+  components clone/update the pinned component checkouts
+  models     download TTS / ASR weights
+  images     build asr / tts / brain images
   env        write/update .env
-  build      build asr / tts / brain images
+  fetch      components + models
+  build      images
+  dist       cross-compile pp1-setup-{os}-{arch}
   up         docker compose up -d
   down       docker compose down
   status     container state + HTTP probes
@@ -184,14 +188,16 @@ and configure, but TTS/ASR need a Linux GPU host.
 ## Development
 
 ```sh
-deno task check             # type-check scripts/onboard.ts
-deno run -A build.ts build  # cross-compile dist/pp1-setup-{os}-{arch}
+deno task check                          # type-check scripts/onboard.ts
+deno run -A scripts/onboard.ts dist      # cross-compile dist/pp1-setup-{os}-{arch}
 ```
 
-The release build is a [nomake](https://github.com/thautwarm/nomake) makefile:
-`build.ts` imports nomake by URL and defines one `deno compile` target per
-platform, so no nomake installation is needed (`nomake build` runs the same file).
-`scripts/release.sh` remains as a dependency-free fallback.
+The whole setup is a [nomake](https://github.com/thautwarm/nomake) dependency graph
+defined in `scripts/onboard.ts`: resources (`components`, `models`), `images`,
+`env`, the `all` aggregate, and one `deno compile` target per platform for `dist`.
+nomake is imported by URL, so no installation is needed — `deno run -A
+scripts/onboard.ts <target>` is enough, and `pp1-setup <target>` is the same file
+compiled.
 
 ## Layout
 

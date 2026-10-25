@@ -8,11 +8,15 @@ deploy/k8s/rendered/
 # downloaded components / weights
 .components/
 models/
+.stamps/
 
 # runtime state
 run/
 logs/
 *.part
+
+# 本地运维记录含内网地址、registry、机器 ID，不进入公开仓库
+worklogs/
 
 # release binaries
 dist/

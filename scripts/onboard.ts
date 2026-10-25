@@ -13,6 +13,7 @@
  * Everything it downloads is public; nothing is uploaded anywhere.
  */
 
+import * as NM from "https://github.com/thautwarm/nomake/raw/v0.1.12/mod.ts";
 import { createHash } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -507,7 +508,7 @@ async function writeEnvFile(
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 interface Opts {
-  command: string;
+  targets: string[];
   root: string;
   dir?: string;
   ports: { tts?: number; stt?: number; brain?: number };
@@ -523,7 +524,7 @@ interface Opts {
 
 function parseArgs(argv: string[]): Opts {
   const o: Opts = {
-    command: "all",
+    targets: [],
     root: Deno.cwd(),
     ports: {},
     chat: {},
@@ -591,7 +592,7 @@ function parseArgs(argv: string[]): Opts {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "-h" || arg === "--help") {
-      o.command = "help";
+      o.targets.push("usage");
       continue;
     }
     if (arg === "--force") {
@@ -619,7 +620,7 @@ function parseArgs(argv: string[]): Opts {
       continue;
     }
     if (arg.startsWith("-")) die(`未知参数 ${arg}`);
-    o.command = arg;
+    o.targets.push(arg);
   }
 
   return o;
@@ -628,20 +629,26 @@ function parseArgs(argv: string[]): Opts {
 const HELP = `pp1 ${VERSION} — all-in-one voice-assistant stack
 
 用法:
-  pp1 onboard <command> [options]
+  pp1-setup [targets] [options]
+  deno run -A scripts/onboard.ts [targets] [options]
 
-命令:
-  all        doctor + fetch + env + build（默认）
-  doctor     检查 docker / GPU / 磁盘
-  fetch      拉取组件源码 + 下载模型
-  env        生成/更新 .env
-  build      构建镜像（ASR / TTS / brain）
-  up         docker compose up -d
-  down       docker compose down
-  status     容器状态
-  smoke      端到端冒烟（TTS / STT / brain）
+targets（nomake 依赖图；\`pp1-setup help\` 列出全部 target）:
+  all          doctor + components + models + images + .env（默认）
+  doctor       docker / GPU / 磁盘检查
+  components   拉取/更新 .components/ 下的组件
+  models       下载 TTS / ASR 权重
+  images       构建 pp1/asr、pp1/brain、pp1/tts
+  .env         生成/更新 .env
+  fetch        components + models
+  build        images
+  up / down    docker compose 起停
+  status       容器 + HTTP 探活
+  smoke        TTS / ASR / brain 端到端
+  dist         编译 pp1-setup-{os}-{arch}
+  version      版本
+  usage        这个帮助
 
-选项:
+options:
   --dir <path>            仓库根目录（默认当前目录）
   --tts-port <n>          TTS 对外端口（默认 6677）
   --stt-port <n>          ASR 对外端口（默认 8082）
@@ -734,7 +741,7 @@ async function cmdDoctor(o: Opts): Promise<Diag> {
   };
 }
 
-async function cmdFetch(o: Opts): Promise<void> {
+async function fetchComponents(o: Opts): Promise<void> {
   step("组件源码");
   const components = join(o.root, ".components");
   await ensureRepo(
@@ -749,32 +756,9 @@ async function cmdFetch(o: Opts): Promise<void> {
     COMPONENTS.brain.ref,
     o.force,
   );
-
-  if (o.skipModels) {
-    warn("--skip-models：跳过模型下载");
-    return;
-  }
-
-  const hf = (o.hfEndpoint ?? Deno.env.get("HF_ENDPOINT") ?? "https://huggingface.co")
-    .replace(/\/+$/, "");
-
-  step("TTS 权重（~8.3 GB）");
-  for (const m of TTS_MODELS) {
-    await downloadFile(
-      `${hf}/${TTS_REPO}/resolve/main/${m.file}`,
-      join(o.root, "models/tts", m.file),
-      m.sha256,
-      m.size,
-      o.force,
-    );
-  }
-
-  step("ASR 权重（~4.7 GB）");
-  await downloadSnapshot(ASR_REPO, join(o.root, "models/asr", ASR_DIR), o);
-
 }
 
-async function cmdEnv(o: Opts, d: Diag): Promise<void> {
+async function cmdEnv(o: Opts, gpu: Gpu): Promise<void> {
   step("生成 .env");
   const path = join(o.root, ".env");
   const existing = await readEnvFile(path);
@@ -806,7 +790,7 @@ async function cmdEnv(o: Opts, d: Diag): Promise<void> {
   const gid = Deno.build.os === "windows" ? "1000" : String(Deno.gid() ?? 1000);
   const daemons = String(
     o.daemons ??
-      (Number(pick("MOSS_DAEMONS", "0")) || daemonsFor(d.gpu.memMiB)),
+      (Number(pick("MOSS_DAEMONS", "0")) || daemonsFor(gpu.memMiB)),
   );
 
   const values: Record<string, string> = {
@@ -880,7 +864,7 @@ async function cmdEnv(o: Opts, d: Diag): Promise<void> {
   }
 }
 
-async function buildTts(o: Opts, d: Diag): Promise<void> {
+async function buildTts(o: Opts, gpu: Gpu): Promise<void> {
   const dir = join(o.root, ".components", COMPONENTS.tts.dir);
   if (!(await exists(dir))) throw new Error("缺少 TTS 源码，先跑 pp1 fetch");
 
@@ -889,7 +873,7 @@ async function buildTts(o: Opts, d: Diag): Promise<void> {
   }
 
   const env: Record<string, string> = { IMAGE: "pp1/tts:latest" };
-  if (d.gpu.cc) env.CUDA_ARCH = d.gpu.cc.replace(".", "");
+  if (gpu.cc) env.CUDA_ARCH = gpu.cc.replace(".", "");
   if (o.jobs) env.JOBS = String(o.jobs);
 
   for (const script of [
@@ -904,27 +888,21 @@ async function buildTts(o: Opts, d: Diag): Promise<void> {
   }
 }
 
-async function cmdBuild(o: Opts, d: Diag): Promise<void> {
-  if (o.skipBuild) {
-    warn("--skip-build：跳过镜像构建");
-    return;
-  }
-
+async function buildAsrImage(o: Opts): Promise<void> {
   step("ASR 镜像（首次 ~10 分钟）");
   await run(["docker", "build", "-t", "pp1/asr:latest", join(o.root, "docker/asr")], {
     stream: true,
   });
+}
 
+async function buildBrainImage(o: Opts): Promise<void> {
   step("brain 镜像");
   const brainDir = join(o.root, ".components", COMPONENTS.brain.dir);
-  if (!(await exists(brainDir))) throw new Error("缺少 brain 源码，先跑 pp1 fetch");
+  if (!(await exists(brainDir))) throw new Error("缺少 brain 源码，先跑 pp1 components");
   await run(
     ["docker", "build", "-f", "Dockerfile.brains", "-t", "pp1/brain:latest", "."],
     { cwd: brainDir, stream: true },
   );
-
-  step("TTS 镜像（首次 ~15 分钟）");
-  await buildTts(o, d);
 }
 
 async function cmdUp(o: Opts): Promise<void> {
@@ -1045,69 +1023,334 @@ async function cmdSmoke(o: Opts): Promise<void> {
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
-async function main(): Promise<void> {
-  const o = parseArgs(Deno.args);
-
-  if (o.command === "help") {
-    console.log(HELP);
-    return;
-  }
-  if (o.command === "version" || o.command === "--version") {
-    console.log(VERSION);
-    return;
-  }
-
-  o.root = await resolveRoot(o.dir ?? Deno.cwd());
-
-  switch (o.command) {
-    case "doctor": {
-      const d = await cmdDoctor(o);
-      if (!d.ok) Deno.exit(1);
-      break;
-    }
-    case "fetch":
-      await cmdFetch(o);
-      break;
-    case "env": {
-      const d = await cmdDoctor(o);
-      await cmdEnv(o, d);
-      break;
-    }
-    case "build": {
-      const d = await cmdDoctor(o);
-      await cmdBuild(o, d);
-      break;
-    }
-    case "up":
-      await cmdUp(o);
-      break;
-    case "down":
-      await cmdDown(o);
-      break;
-    case "status":
-      await cmdStatus(o);
-      break;
-    case "smoke":
-      await cmdSmoke(o);
-      break;
-    case "all": {
-      const d = await cmdDoctor(o);
-      if (!d.ok) die("环境检查未通过（见上面的 ! 项）");
-      await cmdFetch(o);
-      await cmdEnv(o, d);
-      await cmdBuild(o, d);
-      console.log(`\n${paint.bold("下一步")}`);
-      console.log("  docker compose up -d");
-      console.log("  # 然后运行 `pp1 status` / `pp1 smoke`");
-      break;
-    }
-    default:
-      die(`未知命令 ${o.command}\n\n${HELP}`);
-  }
+/** Record that a non-file artifact (component checkout, image) is up to date. */
+async function markStamp(path: string): Promise<void> {
+  await Deno.mkdir(dirname(path), { recursive: true });
+  await Deno.writeTextFile(path, `${new Date().toISOString()}\n`);
 }
 
+// ── nomake targets ────────────────────────────────────────────────────────────
+//
+// The setup is a dependency graph, not a sequence:
+//
+//   doctor ─┬─ components ─┐
+//           ├─ models ─────┼─ images ─┐
+//           └─ .env ───────┘          ├─ all
+//                                     │
+//   scripts/onboard.ts ── dist/pp1-setup-{os}-{arch} ── dist
+//
+// `all` is just the virtual target that pulls the four branches together, so a
+// failed download or image build can be resumed with the same command.
+
+const TARGETS = [
+  ["x86_64-unknown-linux-gnu", "linux-x64"],
+  ["aarch64-unknown-linux-gnu", "linux-arm64"],
+  ["x86_64-apple-darwin", "darwin-x64"],
+  ["aarch64-apple-darwin", "darwin-arm64"],
+  ["x86_64-pc-windows-msvc", "windows-x64.exe"],
+] as const;
+
+function defineTargets(o: Opts, gpu: Gpu): void {
+  const hf = (o.hfEndpoint ?? Deno.env.get("HF_ENDPOINT") ?? "https://huggingface.co")
+    .replace(/\/+$/, "");
+
+  NM.target({
+    name: "doctor",
+    virtual: true,
+    rebuild: "always",
+    doc: "check docker / GPU / disk",
+    async build() {
+      const d = await cmdDoctor(o);
+      if (!d.ok) die("环境检查未通过（见上面的 ! 项）");
+    },
+  });
+
+  // A stamp whose name contains the pinned refs: bumping a ref creates a new
+  // target, so the checkout is refreshed exactly when the pin changes.
+  const componentsStamp =
+    `.stamps/components-${COMPONENTS.tts.ref.slice(0, 8)}-${COMPONENTS.brain.ref.slice(0, 8)}`;
+  NM.target({
+    name: componentsStamp,
+    rebuild: o.force ? "always" : "never",
+    doc: "clone/update the pinned component checkouts",
+    deps: ["doctor"],
+    async build() {
+      await fetchComponents(o);
+      await markStamp(componentsStamp);
+    },
+  });
+
+  // Downloads are real file targets: `never` means "build only when missing",
+  // which is exactly the cache we want. `--force` flips them to `always`, and
+  // nomake then removes the file before rebuilding it.
+  const ttsFiles = TTS_MODELS.map((m) => `models/tts/${m.file}`);
+  TTS_MODELS.forEach((m) => {
+    NM.target({
+      name: `models/tts/${m.file}`,
+      rebuild: o.force ? "always" : "never",
+      doc: `download ${m.file}`,
+      deps: ["doctor"],
+      async build({ target }) {
+        await downloadFile(
+          `${hf}/${TTS_REPO}/resolve/main/${m.file}`,
+          String(target),
+          m.sha256,
+          m.size,
+          o.force,
+        );
+      },
+    });
+  });
+
+  // The ASR snapshot is a directory, so it gets a stamp instead of a file target.
+  const asrStamp = ".stamps/asr-model";
+  NM.target({
+    name: asrStamp,
+    rebuild: o.force ? "always" : "never",
+    doc: "download the Qwen3-ASR-1.7B snapshot",
+    deps: ["doctor"],
+    async build() {
+      await downloadSnapshot(ASR_REPO, join(o.root, "models/asr", ASR_DIR), o);
+      await markStamp(asrStamp);
+    },
+  });
+
+  NM.target({
+    name: "components",
+    virtual: true,
+    rebuild: "always",
+    doc: "clone/update the pinned component checkouts",
+    deps: [componentsStamp],
+    build() {},
+  });
+
+  NM.target({
+    name: "models",
+    virtual: true,
+    rebuild: "always",
+    doc: "all model weights",
+    deps: o.skipModels ? [] : [...ttsFiles, asrStamp],
+    build() {
+      if (o.skipModels) warn("--skip-models：跳过模型下载");
+    },
+  });
+
+  // One stamp per image, keyed by the files that determine its contents.
+  const asrImage = ".stamps/image-asr";
+  NM.target({
+    name: asrImage,
+    rebuild: o.force ? "always" : "onChanged",
+    doc: "build pp1/asr",
+    deps: ["doctor", "docker/asr/Dockerfile", "docker/asr/server.py"],
+    async build() {
+      if (o.skipBuild) {
+        warn("--skip-build：跳过镜像构建");
+        return;
+      }
+      await buildAsrImage(o);
+      await markStamp(asrImage);
+    },
+  });
+
+  const brainImage = ".stamps/image-brain";
+  NM.target({
+    name: brainImage,
+    rebuild: o.force ? "always" : "onChanged",
+    doc: "build pp1/brain",
+    deps: ["components", ".components/pp-brain-server/Dockerfile.brains"],
+    async build() {
+      if (o.skipBuild) {
+        warn("--skip-build：跳过镜像构建");
+        return;
+      }
+      await buildBrainImage(o);
+      await markStamp(brainImage);
+    },
+  });
+
+  const ttsImage = ".stamps/image-tts";
+  NM.target({
+    name: ttsImage,
+    rebuild: o.force ? "always" : "onChanged",
+    doc: "build pp1/tts",
+    deps: [
+      "components",
+      "models",
+      ".components/moss-tts-windowed/docker/Dockerfile",
+      ".components/moss-tts-windowed/server.py",
+    ],
+    async build() {
+      if (o.skipBuild) {
+        warn("--skip-build：跳过镜像构建");
+        return;
+      }
+      await buildTts(o, gpu);
+      await markStamp(ttsImage);
+    },
+  });
+
+  NM.target({
+    name: "images",
+    virtual: true,
+    rebuild: "always",
+    doc: "build pp1/asr, pp1/brain and pp1/tts",
+    deps: [asrImage, brainImage, ttsImage],
+    build() {},
+  });
+
+  NM.target({
+    name: "env",
+    virtual: true,
+    rebuild: "always",
+    doc: "write/refresh .env",
+    deps: ["doctor"],
+    async build() {
+      await cmdEnv(o, gpu);
+    },
+  });
+
+  for (const [triple, name] of TARGETS) {
+    NM.target({
+      name: `dist/pp1-setup-${name}`,
+      doc: `deno compile for ${triple}`,
+      deps: { source: "scripts/onboard.ts" },
+      async build({ deps, target }) {
+        await NM.Shell.runChecked(
+          [
+            Deno.execPath(),
+            "compile",
+            "--allow-all",
+            "--target",
+            triple,
+            "--output",
+            String(target),
+            deps.source,
+          ],
+          { printCmd: true, logError: true },
+        );
+      },
+    });
+  }
+
+  NM.target({
+    name: "dist",
+    virtual: true,
+    rebuild: "always",
+    doc: "cross-compile pp1-setup-{os}-{arch}",
+    deps: TARGETS.map(([, name]) => `dist/pp1-setup-${name}`),
+    build() {
+      NM.Log.msg("binaries: dist/");
+    },
+  });
+
+  NM.target({
+    name: "fetch",
+    virtual: true,
+    rebuild: "always",
+    doc: "components + models",
+    deps: ["components", "models"],
+    build() {},
+  });
+
+  NM.target({
+    name: "build",
+    virtual: true,
+    rebuild: "always",
+    doc: "images",
+    deps: ["images"],
+    build() {},
+  });
+
+  NM.target({
+    name: "all",
+    virtual: true,
+    rebuild: "always",
+    doc: "doctor + components + models + images + .env",
+    deps: ["components", "models", "images", "env"],
+    build() {
+      console.log(`\n${paint.bold("下一步")}`);
+      console.log("  docker compose up -d");
+      console.log("  # 然后 pp1-setup status / pp1-setup smoke");
+    },
+  });
+
+  NM.target({
+    name: "up",
+    virtual: true,
+    rebuild: "always",
+    doc: "docker compose up -d",
+    deps: ["env"],
+    build: () => cmdUp(o),
+  });
+
+  NM.target({
+    name: "down",
+    virtual: true,
+    rebuild: "always",
+    doc: "docker compose down",
+    build: () => cmdDown(o),
+  });
+
+  NM.target({
+    name: "status",
+    virtual: true,
+    rebuild: "always",
+    doc: "container state + HTTP probes",
+    build: () => cmdStatus(o),
+  });
+
+  NM.target({
+    name: "smoke",
+    virtual: true,
+    rebuild: "always",
+    doc: "end-to-end TTS / ASR / brain",
+    build: () => cmdSmoke(o),
+  });
+
+  NM.target({
+    name: "usage",
+    virtual: true,
+    rebuild: "always",
+    doc: "show options and targets",
+    build() {
+      console.log(HELP);
+    },
+  });
+
+  NM.target({
+    name: "version",
+    virtual: true,
+    rebuild: "always",
+    doc: "print the version",
+    build() {
+      console.log(VERSION);
+    },
+  });
+
+  NM.target({
+    name: "clean",
+    virtual: true,
+    rebuild: "always",
+    doc: "remove dist/ (not the weights)",
+    async build() {
+      await Deno.remove(join(o.root, "dist"), { recursive: true }).catch(() => {});
+    },
+  });
+}
+
+// ── bootstrap ─────────────────────────────────────────────────────────────────
 try {
-  await main();
+  const opts = parseArgs(Deno.args);
+  const requested = opts.targets.length > 0 ? opts.targets : ["all"];
+  const needsRepo = requested.some((t) => !["usage", "version", "help"].includes(t));
+  if (needsRepo) {
+    opts.root = await resolveRoot(opts.dir ?? Deno.cwd());
+    // nomake resolves target paths against the process cwd
+    Deno.chdir(opts.root);
+  }
+  const gpu = await detectGpu();
+  defineTargets(opts, gpu);
+  await NM.makefile(requested);
 } catch (e) {
   die(msgOf(e));
 }

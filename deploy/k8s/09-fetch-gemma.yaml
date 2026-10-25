@@ -1,0 +1,132 @@
+# Gemma 3n E4B（音频多模态）权重下载：14.66 GiB / 14 个文件，落到 PVC pp1-chat-models
+# 的 chat/Gemma-3n-E4B-it/ 下（与 Qwen2.5-Omni-7B 并列，随时可回退）。
+#
+# 来源只有 ModelScope：
+#   - hf-mirror 取 google/gemma-3n-E4B-it 是 **401**（HF 上的 Gemma 仓库是 gated，
+#     匿名/镜像没有授权），所以这里不写 hf-mirror 兜底，免得白等一轮重试；
+#   - ModelScope 的 google/gemma-3n-E4B-it 可匿名下载，且 4 个 safetensors 的字节数与
+#     HuggingFace 官方仓库完全一致（15,743,647,548 字节对 15,743,648,308，差的是
+#     .gitattributes 与 notebook.ipynb 这类非权重文件）。
+#
+# sha256 取自 ModelScope 仓库 API（/api/v1/models/google/gemma-3n-E4B-it/repo/files）里
+# 每个文件自己的 Sha256 字段，是这份镜像的发布值。
+#
+# 下载 Job 是**一次性动作**：2026-10-21 已经下完（14 个文件、15 GB，四个分片的 sha256
+# 在 chat pod 里独立复算过，与本文件里 pin 的值一致），Job 已删；所以下面 Job 那段按
+# 03-fetch-weights.yaml 的同一套约定**注释掉**，免得谁整份 apply 又下一遍 15 GB。
+# 要重下（换版本 / PVC 被清）：把下面 `# ---` 起的每一段行首 `# ` 去掉，apply，跑完再注释回来。
+#
+# 空间占用提醒：PVC pp1-chat-models 40 GiB，Qwen2.5-Omni-7B 20.8 GB + Gemma 15 GB
+# 之后只剩 4.5 GB 可用（89%）。要再塞第三个模型得先扩容。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pp1-fetch-gemma-script
+  namespace: pp1
+data:
+  fetch.sh: |
+    #!/bin/sh
+    set -eu
+    DEST="${DEST:-/data}"
+    OUT="$DEST/chat/Gemma-3n-E4B-it"
+    mkdir -p "$OUT"
+
+    MS="https://modelscope.cn/models/google/gemma-3n-E4B-it/resolve/master"
+
+    failed=0
+
+    get() { # get <目标文件> <期望sha256|-> <url...>
+      out="$1"; sha="$2"; shift 2
+      if [ -s "$out" ]; then
+        if [ "$sha" = "-" ] || [ "$(sha256sum "$out" | cut -d' ' -f1)" = "$sha" ]; then
+          echo "SKIP $out ($(wc -c <"$out") bytes)"
+          return 0
+        fi
+      fi
+      for url in "$@"; do
+        echo "GET  $url"
+        rm -f "$out.part"
+        if curl -fL --retry 4 --retry-delay 3 --connect-timeout 20 --max-time 5400 \
+             -o "$out.part" "$url" && [ -s "$out.part" ]; then
+          mv "$out.part" "$out"
+          if [ "$sha" != "-" ]; then
+            got="$(sha256sum "$out" | cut -d' ' -f1)"
+            if [ "$got" != "$sha" ]; then
+              echo "SHA 不匹配 $out：$got != $sha"
+              rm -f "$out"
+              continue
+            fi
+          fi
+          echo "OK   $out ($(wc -c <"$out") bytes)"
+          return 0
+        fi
+        echo "下载失败：$url"
+      done
+      echo "!! $out 全部来源都失败"
+      failed=1
+      return 1
+    }
+
+    get "$OUT/model-00001-of-00004.safetensors" \
+        1af26e1fd61af0dc067252c907bf52900c7cd5864893e29970e6ea87320322a6 \
+        "$MS/model-00001-of-00004.safetensors" || true
+    get "$OUT/model-00002-of-00004.safetensors" \
+        5dff2214c41034789c514931257d804bc0808b8ce709a795a8f966b8cc36c002 \
+        "$MS/model-00002-of-00004.safetensors" || true
+    get "$OUT/model-00003-of-00004.safetensors" \
+        bbe396c49b463b6147243ea883b06a4c09e85d558a392501c2dbfbdd0e1f2f9f \
+        "$MS/model-00003-of-00004.safetensors" || true
+    get "$OUT/model-00004-of-00004.safetensors" \
+        5bebe6d74423ec0cfb6a837d42319c36e5999888832606992a136258cd49e718 \
+        "$MS/model-00004-of-00004.safetensors" || true
+
+    for f in model.safetensors.index.json config.json generation_config.json \
+             preprocessor_config.json processor_config.json special_tokens_map.json \
+             tokenizer.json tokenizer.model tokenizer_config.json chat_template.jinja; do
+      get "$OUT/$f" - "$MS/$f" || true
+    done
+
+    echo "--- 结果 ---"
+    du -sh "$OUT"
+    if [ "$failed" = 0 ]; then
+      date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/.fetch-ok"
+      sha256sum "$OUT"/*.safetensors
+      echo "全部下载完成"
+    else
+      echo "有文件失败，退出码 1"
+      exit 1
+    fi
+# ---
+# apiVersion: batch/v1
+# kind: Job
+# metadata:
+#   name: pp1-fetch-gemma
+#   namespace: pp1
+# spec:
+#   backoffLimit: 0
+#   template:
+#     metadata:
+#       labels: {app: pp1-fetch-gemma}
+#     spec:
+#       restartPolicy: Never
+#       tolerations:
+#         - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+#       containers:
+#         - name: fetch
+#           image: alpine:3.21
+#           imagePullPolicy: IfNotPresent
+#           command: ["/bin/sh", "-c", "command -v curl >/dev/null || apk add --no-cache curl; exec /bin/sh /scripts/fetch.sh"]
+#           env:
+#             - name: DEST
+#               value: /data
+#           volumeMounts:
+#             - {name: models, mountPath: /data}
+#             - {name: script, mountPath: /scripts}
+#           resources:
+#             requests: {cpu: 100m, memory: 128Mi}
+#             limits: {cpu: "2", memory: 1Gi}
+#       volumes:
+#         - name: models
+#           persistentVolumeClaim: {claimName: pp1-chat-models}
+#         - name: script
+#           configMap: {name: pp1-fetch-gemma-script}

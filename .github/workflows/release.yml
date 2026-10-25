@@ -18,9 +18,9 @@ jobs:
         with:
           deno-version: v2.x
       - name: Type check
-        run: deno check scripts/onboard.ts
-      - name: Build setup binaries (nomake)
-        run: deno run -A build.ts build
+        run: deno check --allow-import scripts/onboard.ts
+      - name: Build setup binaries (nomake targets)
+        run: deno run -A scripts/onboard.ts dist
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:

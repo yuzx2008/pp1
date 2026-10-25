@@ -1,0 +1,67 @@
+# asr + tts 合并成一个 Pod（共用一张卡）—— 开发机额度/可用性问题出现时的回退形态。
+# 镜像与开发机用的是同一个合并镜像，启动脚本也同一个。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: asr-tts
+  namespace: pp1
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: asr-tts}
+  template:
+    metadata:
+      labels: {app: asr-tts}
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: asr-tts
+          image: @@IMAGE_REGISTRY@@/pp1/asr-tts:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/opt/pp1/pp1-asr-tts-start.sh", "all"]
+          ports:
+            - {name: asr, containerPort: 8082}
+            - {name: tts, containerPort: 8080}
+          env:
+            - {name: MOSS_DAEMONS, value: "2"}
+            - {name: MOSS_MODELS_DIR, value: /models/tts}
+            - {name: ASR_MODEL, value: /models/asr/Qwen3-ASR-1.7B}
+            # 旧 service/asr 会往 pod 注入 ASR_PORT=tcp://...，这里显式覆盖回数字端口
+            - {name: ASR_PORT, value: "8082"}
+            - {name: CUDA_VISIBLE_DEVICES, value: "0"}
+          readinessProbe:
+            httpGet: {path: /health, port: 8080}
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 30
+          startupProbe:
+            httpGet: {path: /health, port: 8080}
+            failureThreshold: 60
+            periodSeconds: 10
+          resources:
+            requests: {cpu: "2", memory: 8Gi, nvidia.com/gpu: "1"}
+            limits: {cpu: "8", memory: 40Gi, nvidia.com/gpu: "1"}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+            - {name: voices, mountPath: /voices}
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: pp1-models}
+        - name: voices
+          persistentVolumeClaim: {claimName: pp1-voices}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: asr-tts
+  namespace: pp1
+spec:
+  selector: {app: asr-tts}
+  ports:
+    - {name: asr-http, port: 8082, targetPort: 8082}
+    - {name: tts-http, port: 8080, targetPort: 8080}

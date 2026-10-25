@@ -20,6 +20,9 @@
 | `06-brain.yaml` | brain Deployment + Service（不占 GPU） |
 | `07-ingress.yaml` | 一个通配符 Certificate + 三个 Ingress（关缓冲、长超时） |
 | `08-chat.yaml` | chat（vLLM + Qwen2.5-Omni-7B）PVC / 模板 ConfigMap / Deployment / Service（1 张 GPU） |
+| `09-fetch-gemma.yaml` | Gemma 3n E4B 权重下载脚本 ConfigMap（生效）+ 下载 Job（**已注释**，已下完） |
+| `10-chat-gemma-parser.yaml` | Gemma 用的裸 JSON 工具调用解析器 ConfigMap |
+| `11-chat-gemma.yaml` | chat-gemma（vLLM + Gemma 3n E4B）模板 ConfigMap / Deployment / Service（`replicas: 0`，见「Gemma 3n 试行」） |
 | `verify-protocol.py` | 协议级端到端验收脚本（手写 MessagePack，纯标准库） |
 | `local.env.example` | 本地部署值模板：镜像仓库 / ingress 域名 / ClusterIssuer / storageClass / 权重暂存目录 |
 | `render.sh` | 读 `local.env`，把清单里的 `@@占位符@@` 替换掉，输出到 `rendered/` |
@@ -59,13 +62,13 @@ kubectl apply -f rendered/
   （实测对这个值做服务端 dry-run 会被拒：`spec is immutable after creation`），
   换存储要新建 PVC 再搬数据。`@@WEIGHTS_DIR@@` 只影响重下权重时的默认落盘位置，改它无副作用。
 
-## 当前状态（2026-10-20 部署并验收；同日加鉴权 token、TTS 常驻改 2；10-21 chat 改走 device plugin、asr 改 0.1.2 修冷启动超时、asr 改 2 副本滚动更新）
+## 当前状态（2026-10-20 部署并验收；同日加鉴权 token、TTS 常驻改 2；10-21 chat 改走 device plugin、asr 改 0.1.2 修冷启动超时、asr 改 2 副本滚动更新；10-21 晚试了 Gemma 3n E4B 当 chat 端点，结论不切换、`chat-gemma` 留 0 副本）
 
 | 项 | 值 |
 |---|---|
 | pod | `asr-*` **2 个副本**、`tts-*`、`brain-*`、`chat-*` 均 Running（两个权重下载 Job 都已删，权重留在 PVC 里） |
 | GPU | 节点可分配 `nvidia.com/gpu: 4`（time-slicing，见下节），**pp1 已用满 4/4**。物理卡 A：tts 2×~6860 + asr 4976 = 18748 MiB；物理卡 B：chat 26890 + asr 4976 = 31881 MiB；brain 不占 |
-| 权重 | PVC `pp1-models` → `asr/Qwen3-ASR-1.7B/**` + `tts/*.gguf`（12.7 GB） |
+| 权重 | PVC `pp1-models` → `asr/Qwen3-ASR-1.7B/**` + `tts/*.gguf`（12.7 GB）；PVC `pp1-chat-models` → `chat/Qwen2.5-Omni-7B/**`（20.8 GB）+ `chat/Gemma-3n-E4B-it/**`（15 GB，试行用，没在跑）。**该 PVC 40 GiB 已用 89%，只剩 4.5 GB** |
 | 鉴权 | Secret `pp1-brain-token`（bearer token，四个端点都校验）；给人用的那一份副本自己挑地方放，权限 600 |
 | 宿主机挂载点 | `<kubelet root>/pods/<pod-uid>/volumes/kubernetes.io~csi/<pv 名>/mount`（kubelet root 是可配的，用 `kubectl get node -o jsonpath='{.items[0].status.nodeInfo…}'` 或登录节点 `ps -o args= -C kubelet` 查） |
 | 存储子卷 | 两个 PVC 各自对应存储后端的一个子卷，名字用 `kubectl -n pp1 get pv -o yaml` 看 |
@@ -257,7 +260,7 @@ ssh "$CLUSTER_HOST" 'kubectl -n pp1 rollout restart deploy/brain'
 
 ```yaml
 MIGHT_CHAT_API_BASE_URL: http://chat:8000/v1
-MIGHT_CHAT_API_KEY: pp1-local      # 必须非空；本地 vLLM 不校验值
+MIGHT_CHAT_API_KEY: REPLACE-ME-LOCAL-KEY      # 必须非空；本地 vLLM 不校验值
 MIGHT_CHAT_MODEL: qwen2.5-omni-7b
 ```
 
@@ -285,6 +288,89 @@ MIGHT_CHAT_MODEL: qwen2.5-omni-7b
 （≈140 KB），估算值直接顶到 3.5 万 > 10240 的阈值，**每轮 revise 都会顺带触发一次历史摘要**
 （`maybeCompression`，超长时还会把历史截到最近 12 条）。功能上无害（只是多一次 LLM 调用、多一段摘要），
 上面第 3 步的日志里一次 revise 出现两个 `[llm]` 就是这两条。
+
+## 纠错提示词：严格措辞（2026-10-23 上线）
+
+`08-chat.yaml` 的 `pp1-chat-template` 已把纠错条件收紧为：
+
+> Call the notify function ONLY when the transcription contradicts what you actually hear in the audio (different words, numbers or meaning). When you call it, reply with the json object only: {"name": "notify", "arguments": {"warning": "..."}}. If the transcription is faithful to the audio, do NOT call any function and reply with exactly: 转录一致
+
+实测（本地 Qwen2.5-Omni-7B）：忠实转写 `finish=stop`、不调 notify；误导转写 `finish=tool_calls`。A/B 口径下误报 58% → 0%，检出 83% → 67%。
+
+注意：改 ConfigMap 后必须 `kubectl rollout restart deploy/chat`，vLLM 只在启动时读取模板；只 apply 不重启不会生效。
+
+## Gemma 3n E4B 试行（2026-10-21，结论：**不切换**）
+
+需求是「纠错那个端点试试 gemma 4b」。Gemma 系列里**只有 Gemma 3n（E2B / E4B）能收音频**
+（纯 Gemma 3 4B 只支持文本+图像，满足不了这个端点的上行要求），所以试的是 **E4B**。
+
+可行性（都实测过，不是查文档）：
+
+- vLLM 0.32.0 官方镜像原生带 Gemma3n：`Gemma3nForConditionalGeneration` 注册在
+  `models/registry.py`，实现是 `gemma3n_mm.py`（含 audio tower 与
+  `gemma3n_audio_utils.py`）；音频解码走镜像里的 torchcodec + 系统 ffmpeg，Ogg/Opus 直接吃。
+- 权重只能从 **ModelScope** 拿：`google/gemma-3n-E4B-it` 在 HuggingFace 上是 gated，
+  hf-mirror 匿名取是 **401**；ModelScope 可匿名下载，4 个分片的字节数与 HF 官方仓库逐一对齐
+  （15,743,648,308 对 15,743,647,548，差的是 `.gitattributes` / `notebook.ipynb` 这类非权重文件）。
+- 显存：0.55 × 48 GB ≈ 26 GB，实测卡上增量约 25.9 GB，和 Qwen 那份（约 27 GB）同档。
+- 官方模板**没有 tools 分支**（和 Qwen 一样），所以照样得挂一份合成模板
+  （`11-chat-gemma.yaml` 的 `gemma3n-tools.jinja`，音频占位用它认的 `<audio_soft_token>`）；
+  工具调用同样是裸 JSON，复用 Qwen 那套解析器（复制成 `bare_json`，见 `10-chat-gemma-parser.yaml`）。
+
+**GPU 名额**：节点只有 4 个 `nvidia.com/gpu` 单元（asr×2 + tts + chat 已占满），所以
+**同一时刻只能跑一个 chat 端点**。试行时是「先把 `chat` 缩到 0，再把 `chat-gemma` 缩到 1」，
+结束后已缩回（`chat-gemma` 现在 `replicas: 0`，权重留在 PVC 里）。
+
+### 两个硬指标：都过
+
+| 硬指标 | 结果 | 原始输出 |
+|---|---|---|
+| 原生吃音频（听得见） | 过：只给 8 秒 Ogg/Opus，问「这段音频里说了什么」，答「帮我把**日历**的时间戳都改成 RFC 3339 格式」——内容对上了（个别字听错），不是靠文本猜的 | `worklogs/20261021-pp1-chat-gemma-trial/` |
+| 产出 `notify` 工具调用 | 过：`finish_reason: "tool_calls"`，`tool_calls[0].function.name = notify`，参数里带 warning；生产形态（一次 7 段音频，brain 的 `MAX_REVISE_AUDIO`）也 200、1.5 秒返回 | `sse-gemma.txt` |
+
+### 与 Qwen 的质量对比（同一套样本：4 段真实音频 × 忠实/误导两种转写 × 各 3 次 = 每格 12 次）
+
+样本是拿真实 ASR（`/v1/audio/transcriptions`）产出忠实转写，再把其中一段改写成语义相反的
+转写作对照。两组措辞各测一遍：**现役措辞**（仓库里 `08-chat.yaml` 的那句）与**严格措辞**
+（把「只在转写与音频矛盾时才调工具、忠实就回『转录一致』」写死）。
+
+| 组合 | 检出率（转写不符 → 该调） | 误报率（转写忠实 → 不该调） |
+|---|---|---|
+| Qwen2.5-Omni-7B + 现役措辞（= 现在线上） | 10/12 = 83% | 7/12 = 58% |
+| Qwen2.5-Omni-7B + 严格措辞 | 8/12 = 67% | **0/12 = 0%** |
+| Gemma 3n E4B + 现役措辞 | 10/12 = 83% | 11/12 = 92% |
+| Gemma 3n E4B + 严格措辞 | **12/12 = 100%** | 7/12 = 58% |
+
+**为什么不切换**：切换门槛是「检出率 ≥ Qwen 且误报率 ≤ Qwen」，按现役措辞比 Gemma 只打平
+误报（58% 对 58%）；但把两家换成同一句严格措辞再比，**Qwen 的误报降到 0%，Gemma 仍是 58%**
+——也就是说 Gemma 在「忠实转写上也去调 notify」这件事上明显更差（它常在 warning 里写
+「音频确认了这个请求」这种自相矛盾的话，或去挑『RFC三三三九 / RFC3339』这种写法差异）。
+`<asr-warning>` 是直接塞进 agent 队列的，误报率高意味着 agent 频繁被告知「你的转写可能不对」，
+代价比少检出几次更大，所以**保留 Qwen**。
+
+顺带一个发现（**没有落进仓库**，要不要用你定）：把 Qwen 的措辞改成上面那句严格版，
+误报从 58% 直接掉到 0%，代价是检出从 83% 降到 67%。措辞在 `08-chat.yaml` 的模板里，
+改一行即可；本次只做了运行时 A/B（测完已把线上 ConfigMap 还原成仓库版本）。
+
+### 切换 / 回退（各两条命令）
+
+```sh
+# 切到 Gemma 试行（模板、解析器、权重都已就位）
+kubectl -n pp1 scale deploy/chat --replicas=0
+kubectl -n pp1 scale deploy/chat-gemma --replicas=1
+# brain 侧：改 02-config.yaml 的 MIGHT_CHAT_API_BASE_URL=http://chat-gemma:8000/v1、
+# MIGHT_CHAT_MODEL=gemma-3n-e4b-it，再 kubectl apply -f rendered/02-config.yaml
+kubectl -n pp1 rollout restart deploy/brain
+
+# 回退 Qwen（现在是这个状态）
+kubectl -n pp1 scale deploy/chat-gemma --replicas=0
+kubectl -n pp1 scale deploy/chat --replicas=1
+kubectl -n pp1 apply -f rendered/02-config.yaml      # MIGHT_CHAT_* 回到 chat / qwen2.5-omni-7b
+kubectl -n pp1 rollout restart deploy/brain
+```
+
+（`kubectl scale` 要成对做：节点只有 4 个 GPU 单元，两个 chat 同时要 1 个单元的话有一个会
+一直 Pending。）
 
 ## GPU 分配：device plugin 开 time-slicing（2026-10-21 改动 kube-system）
 
@@ -490,3 +576,34 @@ pod 日志里 `Loading ... / Ready.` 出现在 uvicorn 的 `Started server proce
 
 **这只解决「重启之后的第一句话」。** asr 重启的那几十秒本身仍然没有语音能力
 （`Recreate` 策略，pod 不在时 brain 会立刻连接失败，而不是挂 13 秒）。
+
+## 纠错双通道（2026-10-23）
+
+`revise.ts` 改成两条路：
+
+1. 优先看 `notify` 的 tool_calls（原有逻辑，本地 Qwen 走这条）
+2. 没有 tool_calls 时，扫模型文本里的 `<asr-warning>…</asr-warning>`；
+   `<asr-skip-warning>` 是"明确没问题"，不产生警告
+
+镜像 `pp1/brain:0.1.1`（digest `sha256:7d36b94b…`）。解析函数 `extractTaggedWarnings` 有 6 条单测（空的、多段、skip 混排都覆盖）。实测：带 tools 但提示词要求只用标签时，模型输出 `<asr-warning>…</asr-warning>`，解析器能正确提取。
+
+## 开发机额度耗尽与回退（2026-10-23 实测）
+
+- 开发机 `REPLACE-ME-MACHINE-ID` 在 2026-10-22 19:56 被平台停掉，原因是 **`gpu_quota_exhausted`**（本月个人额度 8 卡时已用满）
+- 停机后 asr/tts 不可用，brain 出现 `AudioError: aborted` → 手机转写 502；**这条停机路径关不掉**（`auto-shutdown` 是 disabled，但额度是平台按剩余量算的）
+- 现在回退形态：`12-asr-tts.yaml`（合并镜像、一个 Pod 共用一张卡、不需要 time-slicing），brain 的 `STT/TTS_API_BASE_URL` 指向 `http://asr-tts:8082|8080/v1`
+- 两个坑：pod 会被旧 `service/asr` 注入 `ASR_PORT=tcp://...`，要显式 `ASR_PORT=8082`；PVC 里的软链在 k8s 里不生效，`ASR_MODEL` / `MOSS_MODELS_DIR` 要写真实子目录
+
+### 卡时配额（2026-10-23）
+
+个人月度 GPU 卡时已改为**不限**：
+
+```bash
+mlp admin queues member quota set <queue-id> <user-id> \
+  --cpu-millis 12000 --memory-bytes 90194313216 --gpu-count 1 \
+  --volume-bytes 214748364800 --monthly-gpu-hours -1 --apply
+```
+
+五个字段必须一次给全（接口是整行替换）。改完后 `machine start` 立刻可用。
+
+注意：`12-asr-tts.yaml` 的 replicas 保持 0 —— 它会占掉节点唯一剩余的 GPU 单元，导致开发机调度不上（实测 `Unschedulable: resource in cluster is overused`）。只有开发机不可用时才把它拉起来。

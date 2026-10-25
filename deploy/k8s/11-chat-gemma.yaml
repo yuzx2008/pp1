@@ -1,0 +1,161 @@
+# brain 后台 ASR 修订旁路的**候选** chat 端点：Google Gemma 3n E4B（音频多模态），
+# vLLM 0.32.0 官方镜像 + `Gemma3nForConditionalGeneration`。
+#
+# 为什么是 Gemma 3n E4B：用户要的是「gemma 4b」级别的纠错模型；Gemma 系列里**只有
+# Gemma 3n（E2B / E4B）能收音频**（纯 Gemma 3 4B 只支持文本+图像，不满足 brain
+# 的上行要求）。E4B 是其中的 4B 档。
+# 权重来源与校验见 09-fetch-gemma.yaml（ModelScope 匿名可下；HF 上该仓库是 gated，
+# hf-mirror 直接 401）。
+#
+# 与 08-chat.yaml（Qwen2.5-Omni-7B）的两处关键差异：
+#   1. Gemma 3n 自带模板也**没有 tools 分支**（模板里只有 start_of_turn / 音频软 token），
+#      所以照样挂一份合成模板，把工具清单与「只回裸 JSON」的约定拼进第一个用户回合；
+#   2. 工具调用同样是裸 JSON，用自定义解析器 `bare_json`（ConfigMap pp1-gemma-parser，
+#      源码 /data/build/pp1-chat/bare_json_tool_parser.py）。
+#
+# 这份清单是**整套新增、整套可删**：节点上只有 4 个 nvidia.com/gpu 单元，asr×2 + tts + chat
+# 已经占满，所以**同一时刻只能有一个 chat 端点**：要试 Gemma 先把 `deploy/chat` 缩到 0，
+# 再把这个 Deployment 缩到 1；试完反过来。步骤见 DEPLOY.md「Gemma 3n 试行」一节。
+#
+# replicas 故意写 0：2026-10-21 的试行结论是**不切换**（误报率明显高于 Qwen，见 DEPLOY.md
+# 的对比表）。留 0 是为了让「整份 apply」不会去抢现役 chat 的 GPU 单元；要再试再手动
+# `kubectl -n pp1 scale deploy/chat-gemma --replicas=1`。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pp1-gemma-template
+  namespace: pp1
+data:
+  gemma3n-tools.jinja: |
+    {{ bos_token }}
+    {%- if messages[0]['role'] == 'system' -%}
+        {%- if messages[0]['content'] is string -%}
+            {%- set first_user_prefix = messages[0]['content'] + '\n\n' -%}
+        {%- else -%}
+            {%- set first_user_prefix = messages[0]['content'][0]['text'] + '\n\n' -%}
+        {%- endif -%}
+        {%- set loop_messages = messages[1:] -%}
+    {%- else -%}
+        {%- set first_user_prefix = "" -%}
+        {%- set loop_messages = messages -%}
+    {%- endif -%}
+    {%- if tools -%}
+        {%- set tools_prefix = "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" -%}
+        {%- for tool in tools -%}
+            {%- set tools_prefix = tools_prefix + "\n" + (tool | tojson) -%}
+        {%- endfor -%}
+        {%- set tools_prefix = tools_prefix + "\n</tools>\n\nWhen you call a function, reply with the json object only — no prose, no extra tags:\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n\nCall notify ONLY when the transcription contradicts what you actually hear in the audio (different words, numbers or meaning). If the transcription is faithful to the audio, do NOT call any function and reply with exactly: 转录一致\n\n" -%}
+        {%- set first_user_prefix = tools_prefix + first_user_prefix -%}
+    {%- endif -%}
+    {%- for message in loop_messages -%}
+        {%- if message['role'] == 'assistant' -%}
+            {%- set role = "model" -%}
+        {%- elif message['role'] == 'tool' -%}
+            {#- Gemma 没有 tool 角色，退化成 user（brain 不会走到这条分支） -#}
+            {%- set role = "user" -%}
+        {%- else -%}
+            {%- set role = message['role'] -%}
+        {%- endif -%}
+        {{ '<start_of_turn>' + role + '\n' + (first_user_prefix if loop.first else "") }}
+        {%- if message['content'] is string -%}
+            {{ message['content'] | trim }}
+        {%- elif message['content'] is iterable -%}
+            {%- for item in message['content'] -%}
+                {%- if item['type'] == 'audio' or 'input_audio' in item or 'audio_url' in item -%}
+                    {{ '<audio_soft_token>' }}
+                {%- elif item['type'] == 'image' or 'image_url' in item -%}
+                    {{ '<image_soft_token>' }}
+                {%- elif item['type'] == 'text' -%}
+                    {{ item['text'] | trim }}
+                {%- endif -%}
+            {%- endfor -%}
+        {%- endif -%}
+        {%- if message['role'] == 'assistant' and message['tool_calls'] -%}
+            {%- for tool_call in message['tool_calls'] -%}
+                {%- set fn = tool_call['function'] if 'function' in tool_call else tool_call -%}
+                {{ '\n' + '{"name": "' + fn['name'] + '", "arguments": ' + (fn['arguments'] if fn['arguments'] is string else (fn['arguments'] | tojson)) + '}' }}
+            {%- endfor -%}
+        {%- endif -%}
+        {{ '<end_of_turn>\n' }}
+    {%- endfor -%}
+    {%- if add_generation_prompt -%}
+        {{ '<start_of_turn>model\n' }}
+    {%- endif -%}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-gemma
+  namespace: pp1
+spec:
+  replicas: 0
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: chat-gemma}
+  template:
+    metadata:
+      labels: {app: chat-gemma}
+    spec:
+      tolerations:
+        - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      containers:
+        - name: chat-gemma
+          image: @@IMAGE_REGISTRY@@/pp1/chat-vllm:v0.32.0
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            # subPath 已经把 PVC 的 chat/ 挂成 /models，所以这里只有一层
+            - /models/Gemma-3n-E4B-it
+            - --served-model-name=gemma-3n-e4b-it
+            - --host=0.0.0.0
+            - --port=8000
+            - --chat-template=/templates/gemma3n-tools.jinja
+            - --enable-auto-tool-choice
+            - --tool-parser-plugin=/plugins/bare_json_tool_parser.py
+            - --tool-call-parser=bare_json
+            # Qwen 那份是 0.55（≈27 GB）。这里同样按「可能和 tts 同卡」取：
+            # 27 GB + tts 两个常驻 daemon 13.7 GB ≈ 40.7 GB，48 GB 卡内。
+            - --gpu-memory-utilization=0.55
+            - --max-model-len=32768
+            # 修订请求最多带 7 段音频（brain 的 MAX_REVISE_AUDIO）
+            - --limit-mm-per-prompt={"audio":8,"image":1,"video":1}
+          ports:
+            - {name: http, containerPort: 8000}
+          volumeMounts:
+            - {name: models, mountPath: /models, subPath: chat, readOnly: true}
+            - {name: templates, mountPath: /templates, readOnly: true}
+            - {name: parser, mountPath: /plugins, readOnly: true}
+          resources:
+            requests: {cpu: "2", memory: 16Gi, nvidia.com/gpu: 1}
+            limits: {cpu: "8", memory: 48Gi, nvidia.com/gpu: 1}
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 120
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 15
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: pp1-chat-models}
+        - name: templates
+          configMap: {name: pp1-gemma-template}
+        - name: parser
+          configMap: {name: pp1-gemma-parser}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat-gemma
+  namespace: pp1
+spec:
+  type: ClusterIP
+  selector: {app: chat-gemma}
+  ports:
+    - {name: http, port: 8000, targetPort: http}

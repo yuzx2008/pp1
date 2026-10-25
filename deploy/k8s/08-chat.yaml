@@ -42,7 +42,7 @@ data:
             {{- "\n" }}
             {{- tool | tojson }}
         {%- endfor %}
-        {{- "\n</tools>\n\nWhen you call a function, reply with the json object only — no prose, no extra tags:\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n\nIMPORTANT: only when the transcript is unfaithful to the audio or could mislead the agent, you MUST call the matching function instead of explaining it in words. Otherwise call no function and answer the user's request in text as usual.<|im_end|>\n" }}
+        {{- "\n</tools>\n\nWhen you call a function, reply with the json object only — no prose, no extra tags:\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n\nCall the notify function ONLY when the transcription contradicts what you actually hear in the audio (different words, numbers or meaning). When you call it, reply with the json object only, no prose: {\"name\": \"notify\", \"arguments\": {\"warning\": \"...\"}}. If the transcription is faithful to the audio, do NOT call any function and reply with exactly: 转录一致<|im_end|>\n" }}
     {%- else %}
         {%- if messages[0]['role'] == 'system' %}
             {{- '<|im_start|>system\n' + messages[0]['content'] + '<|im_end|>\n' }}

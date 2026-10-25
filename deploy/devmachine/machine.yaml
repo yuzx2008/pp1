@@ -1,0 +1,34 @@
+# zmlp 开发机创建模板（mlp machine create -f machine.yaml --dry-run -o yaml）。
+# 两种请求体别混：
+#   - 这是 **mlp CLI 的 manifest**（instanceTypeId / queueId / directoryId）；
+#   - 服务端 HTTP 接口要的是展开后的 GPU 数、CPU、内存、PVC 名（由 CLI 算）。
+# 真正创建前必须先确认 instanceTypeId 在队列里可用、subpath 已存在。
+name: pp1-gpu
+
+# 镜像必须是 sha256 摘要（CLI 校验 ^.+@sha256:[a-f0-9]{64}$），tag 不行。
+# 用平台自带开发机镜像即可：它带 sshd、agent 入口，以及 docker/nerdctl 客户端。
+# 填法：mlp image list / mlp metadata platform-images 里选一个，复制完整 digest。
+image: REPLACE_ME/pp1-devbase@sha256:REPLACE_ME
+
+# 系统盘只放镜像层和临时文件；34GB 权重和日志都在项目卷上。
+rootfsSize: 200Gi
+
+# 队列 UUID（queue- 开头的短 ID），不是队列名。
+queueId: queue-REPLACE_ME
+
+# 2 张 4090 整机：GPU0 跑 asr+tts，GPU1 跑 chat。
+# 备选：ml.g4090.2xlarge（1 卡），但那样 chat 和 asr/tts 又得挤一张卡。
+instanceTypeId: ml.g4090.4xlarge
+
+mounts:
+  # directoryId 是项目卷短 ID（pv-...），必须与开发机同 namespace 且已授权给当前用户。
+  # subpath 必须**已经存在**：平台不会自动建目录，缺失时创建会卡在 FailedMount。
+  # 容器内 /models 就是这个 subpath，所以卷上的 pp1/ 前缀下放 asr/tts/chat/voices/pp1。
+  - directoryId: pv-REPLACE_ME
+    subpath: pp1
+    containerPath: /models
+    access: rw
+
+# 可选：把机器到期时间或空闲关机写死在模板里，避免忘记关。
+# shutdownAt: 2026-11-01T00:00:00Z
+# idleTimeoutSeconds: 7200

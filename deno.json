@@ -5,9 +5,8 @@
   "tasks": {
     "onboard": "deno run -A scripts/onboard.ts",
     "doctor": "deno run -A scripts/onboard.ts doctor",
-    "check": "deno check scripts/onboard.ts",
-    "build:setup": "deno run -A build.ts build",
-    "release": "deno run -A build.ts build"
+    "check": "deno check --allow-import scripts/onboard.ts",
+    "release": "deno run -A scripts/onboard.ts dist"
   },
   "fmt": {
     "lineWidth": 100

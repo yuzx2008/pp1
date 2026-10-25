@@ -16,7 +16,7 @@ jobs:
           deno-version: v2.x
 
       - name: Type-check the onboard script
-        run: deno check scripts/onboard.ts
+        run: deno check --allow-import scripts/onboard.ts
 
       - name: Compose config sanity check
         run: |

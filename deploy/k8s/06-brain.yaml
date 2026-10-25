@@ -18,7 +18,7 @@ spec:
       containers:
         - name: brain
           # 必须带 registry 前缀（原因同 04-asr.yaml）
-          image: @@IMAGE_REGISTRY@@/pp1/brain:0.1.0
+          image: @@IMAGE_REGISTRY@@/pp1/brain:0.1.1
           imagePullPolicy: IfNotPresent
           ports:
             - {name: http, containerPort: 8787}
